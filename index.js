@@ -13,7 +13,7 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds]
 });
 
-// ===== BARRA XP =====
+// ===== UTILITÁRIO: BARRA XP =====
 function criarBarraXp(xp, level) {
     const max = level * 500;
     const progresso = Math.min(xp / max, 1);
@@ -34,14 +34,14 @@ client.on(Events.InteractionCreate, async interaction => {
         if (interaction.isButton()) {
 
             if (interaction.customId.startsWith('jogo_escolha_')) {
-
                 const id = interaction.customId.split('_')[2];
                 const game = await getGameDetails(id);
 
                 const embed = new EmbedBuilder()
                     .setTitle(game.name)
                     .setDescription(game.description_raw?.slice(0, 500) || "Sem descrição")
-                    .setThumbnail(game.background_image);
+                    .setThumbnail(game.background_image)
+                    .setColor(0x5865F2);
 
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder()
@@ -54,7 +54,6 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (interaction.customId.startsWith('avaliar_jogo_')) {
-
                 const id = interaction.customId.split('_')[2];
 
                 const modal = new ModalBuilder()
@@ -64,70 +63,75 @@ client.on(Events.InteractionCreate, async interaction => {
                 const notaInput = new TextInputBuilder()
                     .setCustomId('nota')
                     .setLabel('Nota (0-10)')
-                    .setStyle(TextInputStyle.Short);
+                    .setPlaceholder('Ex: 8.5')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
 
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(notaInput)
-                );
-
+                modal.addComponents(new ActionRowBuilder().addComponents(notaInput));
                 await interaction.showModal(modal);
             }
 
             if (interaction.customId.startsWith('xp_')) {
-
-                const [_, tipo, gameId, nota] = interaction.customId.split('_');
-
+                const [_, tipo, gameId, notaStr] = interaction.customId.split('_');
                 const userId = interaction.user.id;
                 const username = interaction.user.tag;
-                const score = parseFloat(nota);
+                
+                // Validação de segurança para a nota
+                let score = parseFloat(notaStr.replace(',', '.'));
+                if (isNaN(score)) score = 0;
+                score = Math.max(0, Math.min(10, score));
 
-                let xp = tipo === 'zerou' ? 50 : 200;
+                let gainXp = tipo === 'zerou' ? 50 : 200;
 
+                // 1. Salvar voto individual
                 db.prepare(`
-                    INSERT INTO votos_jogos VALUES (?, ?, ?, ?)
+                    INSERT INTO votos_jogos (game_id, user_id, username, score) 
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(game_id, user_id) DO UPDATE SET score=excluded.score
                 `).run(gameId, userId, username, score);
 
+                // 2. Calcular média global do jogo
                 const stats = db.prepare(`
-                    SELECT AVG(score) avg, COUNT(*) total FROM votos_jogos WHERE game_id=?
+                    SELECT AVG(score) as avg, COUNT(*) as total FROM votos_jogos WHERE game_id=?
                 `).get(gameId);
 
                 const game = await getGameDetails(gameId);
 
+                // 3. Atualizar tabela de avaliações (Corrigido para 'title')
                 db.prepare(`
-                    INSERT INTO avaliacoes_jogos VALUES (?, ?, ?, ?)
+                    INSERT INTO avaliacoes_jogos (game_id, title, server_score, vote_count) 
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(game_id) DO UPDATE SET
                     server_score=excluded.server_score,
                     vote_count=excluded.vote_count
                 `).run(gameId, game.name, stats.avg, stats.total);
 
+                // 4. Sistema de XP
                 const user = db.prepare(`SELECT * FROM usuarios WHERE user_id=?`).get(userId);
+                let totalXp = (user?.xp || 0) + gainXp;
+                let level = user?.level || 1;
 
-                let totalXp = user ? user.xp : 0;
-                let level = user ? user.level : 1;
-
-                totalXp += xp;
-
-                if (totalXp >= level * 500) level++;
+                while (totalXp >= level * 500) {
+                    totalXp -= (level * 500);
+                    level++;
+                }
 
                 db.prepare(`
-                    INSERT INTO usuarios VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET xp=?, level=?
-                `).run(userId, username, totalXp, level, totalXp, level);
+                    INSERT INTO usuarios (user_id, username, xp, level) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET xp=?, level=?, username=?
+                `).run(userId, username, totalXp, level, totalXp, level, username);
 
                 await interaction.update({
-                    content: `🎮 +${xp} XP | 🏆 Nível ${level}`,
+                    content: `✅ Avaliação registrada! **+${gainXp} XP** | 🏆 Nível **${level}**`,
                     embeds: [],
                     components: []
                 });
             }
-
             return;
         }
 
         // ================= MODAL =================
         if (interaction.isModalSubmit()) {
-
             const gameId = interaction.customId.split('_')[1];
             const nota = interaction.fields.getTextInputValue('nota');
 
@@ -136,7 +140,6 @@ client.on(Events.InteractionCreate, async interaction => {
                     .setCustomId(`xp_zerou_${gameId}_${nota}`)
                     .setLabel('🎮 Zerou (+50 XP)')
                     .setStyle(ButtonStyle.Primary),
-
                 new ButtonBuilder()
                     .setCustomId(`xp_100_${gameId}_${nota}`)
                     .setLabel('💯 100% (+200 XP)')
@@ -144,148 +147,111 @@ client.on(Events.InteractionCreate, async interaction => {
             );
 
             await interaction.reply({
-                content: "Escolha como você completou:",
+                content: `Você deu nota **${nota}**! Como você completou o jogo?`,
                 components: [row],
                 ephemeral: true
             });
-
             return;
         }
 
         // ================= COMANDOS =================
         if (interaction.isChatInputCommand()) {
-
             const { commandName } = interaction;
 
-            // ===== BUSCAR JOGO =====
             if (commandName === 'jogo') {
-
                 await interaction.deferReply();
-
                 const nome = interaction.options.getString('titulo');
                 const results = await searchGame(nome);
 
-                const embed = new EmbedBuilder()
-                    .setTitle("Resultados")
-                    .setDescription(results.slice(0, 5).map((g,i)=>`${i+1}. ${g.name}`).join('\n'));
-
-                const row = new ActionRowBuilder().addComponents(
-                    results.slice(0,5).map((g,i)=>
-                        new ButtonBuilder()
-                        .setCustomId(`jogo_escolha_${g.id}`)
-                        .setLabel(`${i+1}`)
-                        .setStyle(ButtonStyle.Primary)
-                    )
-                );
-
-                await interaction.editReply({ embeds:[embed], components:[row] });
-            }
-
-            // ===== PERFIL =====
-            if (commandName === 'perfil') {
-
-                await interaction.deferReply();
-
-                const user = interaction.options.getUser('usuario') || interaction.user;
-
-                const stats = db.prepare(`
-                    SELECT xp, level FROM usuarios WHERE user_id=?
-                `).get(user.id);
-
-                const barra = criarBarraXp(stats?.xp || 0, stats?.level || 1);
-
-                const embed = new EmbedBuilder()
-                    .setTitle(`👤 ${user.tag}`)
-                    .addFields(
-                        { name: "🏆 Nível", value: (stats?.level || 1).toString(), inline: true },
-                        { name: "✨ XP", value: barra }
-                    );
-
-                await interaction.editReply({ embeds:[embed] });
-            }
-
-            // ===== RANKING =====
-            if (commandName === 'ranking') {
-
-                await interaction.deferReply();
-
-                const top = db.prepare(`
-                    SELECT username, xp FROM usuarios
-                    ORDER BY xp DESC
-                    LIMIT 10
-                `).all();
-
-                if (!top.length) {
-                    return interaction.editReply("Ninguém no ranking ainda.");
-                }
-
-                const texto = top.map((u, i) =>
-                    `**${i+1}.** ${u.username} — ${u.xp} XP`
-                ).join("\n");
-
-                const embed = new EmbedBuilder()
-                    .setTitle("🏆 Ranking")
-                    .setDescription(texto);
-
-                await interaction.editReply({ embeds: [embed] });
-            }
-
-            // ===== RECOMENDAR JOGO =====
-            if (commandName === 'recomendarjogo') {
-
-                await interaction.deferReply();
-
-                const nome = interaction.options.getString('titulo');
-                const results = await searchGame(nome);
-
-                if (!results.length) {
+                if (!results || results.length === 0) {
                     return interaction.editReply("❌ Nenhum jogo encontrado.");
                 }
 
-                const jogo = results[0];
-
                 const embed = new EmbedBuilder()
-                    .setTitle(`🎮 Recomendação: ${jogo.name}`)
-                    .setDescription("Recomendado pela comunidade!")
-                    .setThumbnail(jogo.background_image);
+                    .setTitle(`Resultados para: ${nome}`)
+                    .setDescription(results.slice(0, 5).map((g, i) => `**${i + 1}.** ${g.name}`).join('\n'))
+                    .setColor(0x5865F2);
+
+                const row = new ActionRowBuilder().addComponents(
+                    results.slice(0, 5).map((g, i) =>
+                        new ButtonBuilder()
+                            .setCustomId(`jogo_escolha_${g.id}`)
+                            .setLabel(`${i + 1}`)
+                            .setStyle(ButtonStyle.Secondary)
+                    )
+                );
+
+                await interaction.editReply({ embeds: [embed], components: [row] });
+            }
+
+            if (commandName === 'jogosavaliados') {
+                await interaction.deferReply();
+                const jogos = db.prepare(`SELECT title, server_score, vote_count FROM avaliacoes_jogos ORDER BY server_score DESC`).all();
+
+                if (!jogos.length) return interaction.editReply("Nenhum jogo avaliado ainda.");
+
+                const lista = jogos.map(j => `⭐ **${j.server_score.toFixed(1)}** | ${j.title} (${j.vote_count} votos)`).join('\n');
+                const embed = new EmbedBuilder()
+                    .setTitle("🏆 Jogos Avaliados pelo Servidor")
+                    .setDescription(lista.slice(0, 4000))
+                    .setColor(0xFFD700);
 
                 await interaction.editReply({ embeds: [embed] });
             }
 
-            // ===== RECOMENDAÇÃO INTELIGENTE =====
-            if (commandName === 'recomendacaointeligente') {
-
+            if (commandName === 'perfil') {
                 await interaction.deferReply();
+                const target = interaction.options.getUser('usuario') || interaction.user;
+                const stats = db.prepare(`SELECT xp, level FROM usuarios WHERE user_id=?`).get(target.id);
 
-                const topGame = db.prepare(`
-                    SELECT game_name, server_score 
-                    FROM avaliacoes_jogos
-                    ORDER BY server_score DESC
-                    LIMIT 1
-                `).get();
-
-                if (!topGame) {
-                    return interaction.editReply("Ainda não há recomendações.");
-                }
+                const xp = stats?.xp || 0;
+                const lvl = stats?.level || 1;
+                const barra = criarBarraXp(xp, lvl);
 
                 const embed = new EmbedBuilder()
-                    .setTitle("🧠 Recomendação Inteligente")
-                    .setDescription(`🔥 ${topGame.game_name}\n⭐ Nota média: ${topGame.server_score.toFixed(1)}`);
+                    .setTitle(`Perfil de ${target.username}`)
+                    .setThumbnail(target.displayAvatarURL())
+                    .addFields(
+                        { name: "🏆 Nível", value: lvl.toString(), inline: true },
+                        { name: "✨ Progresso", value: barra }
+                    )
+                    .setColor(0x00AE86);
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            if (commandName === 'ranking') {
+                await interaction.deferReply();
+                const top = db.prepare(`SELECT username, xp, level FROM usuarios ORDER BY level DESC, xp DESC LIMIT 10`).all();
+
+                if (!top.length) return interaction.editReply("Ranking vazio.");
+
+                const texto = top.map((u, i) => `**${i + 1}.** ${u.username} — Lvl ${u.level} (${u.xp} XP)`).join("\n");
+                const embed = new EmbedBuilder().setTitle("🏆 Top Players").setDescription(texto).setColor(0xF1C40F);
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            if (commandName === 'recomendacaointeligente') {
+                await interaction.deferReply();
+                // Corrigido: usando 'title' em vez de 'game_name'
+                const topGame = db.prepare(`SELECT title, server_score FROM avaliacoes_jogos ORDER BY server_score DESC LIMIT 1`).get();
+
+                if (!topGame) return interaction.editReply("Ainda não temos dados suficientes.");
+
+                const embed = new EmbedBuilder()
+                    .setTitle("🧠 Sugestão da Comunidade")
+                    .setDescription(`Baseado nas notas, você deveria jogar:\n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
+                    .setColor(0x9B59B6);
 
                 await interaction.editReply({ embeds: [embed] });
             }
         }
-
     } catch (err) {
-        console.error(err);
-
-        try {
-            if (interaction.deferred || interaction.replied) {
-                await interaction.editReply("❌ Erro");
-            } else {
-                await interaction.reply({ content: "❌ Erro", ephemeral: true });
-            }
-        } catch {}
+        console.error("ERRO NA INTERAÇÃO:", err);
+        if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ content: "Houve um erro ao processar seu comando.", ephemeral: true }).catch(() => {});
+        }
     }
 });
 
