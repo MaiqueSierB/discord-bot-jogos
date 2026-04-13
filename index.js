@@ -76,28 +76,27 @@ client.on(Events.InteractionCreate, async interaction => {
                 const userId = interaction.user.id;
                 const username = interaction.user.tag;
                 
-                // Validação de segurança para a nota
                 let score = parseFloat(notaStr.replace(',', '.'));
                 if (isNaN(score)) score = 0;
                 score = Math.max(0, Math.min(10, score));
 
                 let gainXp = tipo === 'zerou' ? 50 : 200;
 
-                // 1. Salvar voto individual
+                // 1. Salvar/Atualizar voto individual
                 db.prepare(`
                     INSERT INTO votos_jogos (game_id, user_id, username, score) 
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(game_id, user_id) DO UPDATE SET score=excluded.score
                 `).run(gameId, userId, username, score);
 
-                // 2. Calcular média global do jogo
+                // 2. Recalcular média do servidor para este jogo
                 const stats = db.prepare(`
                     SELECT AVG(score) as avg, COUNT(*) as total FROM votos_jogos WHERE game_id=?
                 `).get(gameId);
 
                 const game = await getGameDetails(gameId);
 
-                // 3. Atualizar tabela de avaliações (Corrigido para 'title')
+                // 3. Atualizar tabela global de avaliações
                 db.prepare(`
                     INSERT INTO avaliacoes_jogos (game_id, title, server_score, vote_count) 
                     VALUES (?, ?, ?, ?)
@@ -106,7 +105,7 @@ client.on(Events.InteractionCreate, async interaction => {
                     vote_count=excluded.vote_count
                 `).run(gameId, game.name, stats.avg, stats.total);
 
-                // 4. Sistema de XP
+                // 4. Sistema de XP e Nível
                 const user = db.prepare(`SELECT * FROM usuarios WHERE user_id=?`).get(userId);
                 let totalXp = (user?.xp || 0) + gainXp;
                 let level = user?.level || 1;
@@ -154,10 +153,11 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // ================= COMANDOS =================
+        // ================= COMANDOS SLASH =================
         if (interaction.isChatInputCommand()) {
             const { commandName } = interaction;
 
+            // BUSCAR JOGO
             if (commandName === 'jogo') {
                 await interaction.deferReply();
                 const nome = interaction.options.getString('titulo');
@@ -184,6 +184,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.editReply({ embeds: [embed], components: [row] });
             }
 
+            // LISTAR JOGOS AVALIADOS
             if (commandName === 'jogosavaliados') {
                 await interaction.deferReply();
                 const jogos = db.prepare(`SELECT title, server_score, vote_count FROM avaliacoes_jogos ORDER BY server_score DESC`).all();
@@ -192,13 +193,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 const lista = jogos.map(j => `⭐ **${j.server_score.toFixed(1)}** | ${j.title} (${j.vote_count} votos)`).join('\n');
                 const embed = new EmbedBuilder()
-                    .setTitle("🏆 Jogos Avaliados pelo Servidor")
+                    .setTitle("🏆 Biblioteca do Servidor")
                     .setDescription(lista.slice(0, 4000))
                     .setColor(0xFFD700);
 
                 await interaction.editReply({ embeds: [embed] });
             }
 
+            // PERFIL DO JOGADOR
             if (commandName === 'perfil') {
                 await interaction.deferReply();
                 const target = interaction.options.getUser('usuario') || interaction.user;
@@ -220,6 +222,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.editReply({ embeds: [embed] });
             }
 
+            // RANKING DE XP
             if (commandName === 'ranking') {
                 await interaction.deferReply();
                 const top = db.prepare(`SELECT username, xp, level FROM usuarios ORDER BY level DESC, xp DESC LIMIT 10`).all();
@@ -232,17 +235,31 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.editReply({ embeds: [embed] });
             }
 
+            // RECOMENDAÇÃO INTELIGENTE (FILTRADA)
             if (commandName === 'recomendacaointeligente') {
                 await interaction.deferReply();
-                // Corrigido: usando 'title' em vez de 'game_name'
-                const topGame = db.prepare(`SELECT title, server_score FROM avaliacoes_jogos ORDER BY server_score DESC LIMIT 1`).get();
+                const userId = interaction.user.id;
 
-                if (!topGame) return interaction.editReply("Ainda não temos dados suficientes.");
+                // Busca o jogo melhor avaliado que o usuário ainda NÃO votou
+                const topGame = db.prepare(`
+                    SELECT title, server_score 
+                    FROM avaliacoes_jogos 
+                    WHERE game_id NOT IN (
+                        SELECT game_id FROM votos_jogos WHERE user_id = ?
+                    )
+                    ORDER BY server_score DESC 
+                    LIMIT 1
+                `).get(userId);
+
+                if (!topGame) {
+                    return interaction.editReply("✨ Você já avaliou todos os jogos da nossa base ou não há jogos avaliados ainda!");
+                }
 
                 const embed = new EmbedBuilder()
-                    .setTitle("🧠 Sugestão da Comunidade")
-                    .setDescription(`Baseado nas notas, você deveria jogar:\n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
-                    .setColor(0x9B59B6);
+                    .setTitle("🧠 Sugestão Personalizada")
+                    .setDescription(`Baseado na média do servidor, mas que você **ainda não jogou**: \n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
+                    .setColor(0x9B59B6)
+                    .setFooter({ text: "Dica: Use /jogo para avaliar novos títulos!" });
 
                 await interaction.editReply({ embeds: [embed] });
             }
