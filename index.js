@@ -1,30 +1,30 @@
 import {
-    Client, Events, GatewayIntentBits,
-    EmbedBuilder, ActionRowBuilder,
-    ButtonBuilder, ButtonStyle,
-    ModalBuilder, TextInputBuilder, TextInputStyle
+    Client,
+    Events,
+    GatewayIntentBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle
 } from 'discord.js';
 
 import db from "./db.js";
 import config from './config.js';
-import { searchGame, getGameDetails } from './rawg.js';
+import {
+    searchMovie,
+    getMovieDetails,
+    getMoviesByGenre
+} from './tmdb.js';
 
 const client = new Client({
     intents: [GatewayIntentBits.Guilds]
 });
 
-// ===== UTILITÁRIO: BARRA XP =====
-function criarBarraXp(xp, level) {
-    const max = level * 500;
-    const progresso = Math.min(xp / max, 1);
-    const total = 10;
-    const filled = Math.round(progresso * total);
-
-    return "🟩".repeat(filled) + "⬜".repeat(total - filled) + ` (${xp}/${max})`;
-}
-
 client.once(Events.ClientReady, c => {
-    console.log(`🎮 Bot online como ${c.user.tag}`);
+    console.log(`🎬 RMDB online como ${c.user.tag}`);
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -33,241 +33,221 @@ client.on(Events.InteractionCreate, async interaction => {
         // ================= BOTÕES =================
         if (interaction.isButton()) {
 
-            if (interaction.customId.startsWith('jogo_escolha_')) {
-                const id = interaction.customId.split('_')[2];
-                const game = await getGameDetails(id);
+            if (interaction.customId.startsWith('filme_escolha_')) {
+
+                const [, , id, tipo] = interaction.customId.split('_');
+
+                const movie = await getMovieDetails(id, tipo);
+
+                const titulo = movie.title || movie.name;
+                const data = movie.release_date || movie.first_air_date;
+
+                const posterUrl = movie.poster_path
+                    ? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
+                    : null;
 
                 const embed = new EmbedBuilder()
-                    .setTitle(game.name)
-                    .setDescription(game.description_raw?.slice(0, 500) || "Sem descrição")
-                    .setThumbnail(game.background_image)
-                    .setColor(0x5865F2);
+                    .setTitle(`${titulo} (${data ? new Date(data).getFullYear() : 's/ano'})`)
+                    .setDescription(movie.overview || "Sem descrição.")
+                    .addFields({
+                        name: "Nota TMDB",
+                        value: movie.vote_average?.toFixed(1) || "0",
+                        inline: true
+                    });
+
+                if (posterUrl) embed.setThumbnail(posterUrl);
 
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder()
-                        .setCustomId(`avaliar_jogo_${id}`)
+                        .setCustomId(`avaliar_filme_${id}_${tipo}`)
                         .setLabel('Dar nota')
                         .setStyle(ButtonStyle.Success)
                 );
 
-                await interaction.update({ embeds: [embed], components: [row] });
+                await interaction.update({
+                    embeds: [embed],
+                    components: [row]
+                });
             }
 
-            if (interaction.customId.startsWith('avaliar_jogo_')) {
-                const id = interaction.customId.split('_')[2];
+            if (interaction.customId.startsWith('avaliar_filme_')) {
+
+                const [, , id, tipo] = interaction.customId.split('_');
 
                 const modal = new ModalBuilder()
-                    .setCustomId(`modal_${id}`)
-                    .setTitle('Avaliar jogo');
+                    .setCustomId(`modal_${id}_${tipo}`)
+                    .setTitle('Avaliar');
 
-                const notaInput = new TextInputBuilder()
+                const input = new TextInputBuilder()
                     .setCustomId('nota')
                     .setLabel('Nota (0-10)')
-                    .setPlaceholder('Ex: 8.5')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
+                    .setStyle(TextInputStyle.Short);
 
-                modal.addComponents(new ActionRowBuilder().addComponents(notaInput));
+                modal.addComponents(new ActionRowBuilder().addComponents(input));
+
                 await interaction.showModal(modal);
             }
 
-            if (interaction.customId.startsWith('xp_')) {
-                const [_, tipo, gameId, notaStr] = interaction.customId.split('_');
-                const userId = interaction.user.id;
-                const username = interaction.user.tag;
-                
-                let score = parseFloat(notaStr.replace(',', '.'));
-                if (isNaN(score)) score = 0;
-                score = Math.max(0, Math.min(10, score));
-
-                let gainXp = tipo === 'zerou' ? 50 : 200;
-
-                // 1. Salvar/Atualizar voto individual
-                db.prepare(`
-                    INSERT INTO votos_jogos (game_id, user_id, username, score) 
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(game_id, user_id) DO UPDATE SET score=excluded.score
-                `).run(gameId, userId, username, score);
-
-                // 2. Recalcular média do servidor para este jogo
-                const stats = db.prepare(`
-                    SELECT AVG(score) as avg, COUNT(*) as total FROM votos_jogos WHERE game_id=?
-                `).get(gameId);
-
-                const game = await getGameDetails(gameId);
-
-                // 3. Atualizar tabela global de avaliações
-                db.prepare(`
-                    INSERT INTO avaliacoes_jogos (game_id, title, server_score, vote_count) 
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(game_id) DO UPDATE SET
-                    server_score=excluded.server_score,
-                    vote_count=excluded.vote_count
-                `).run(gameId, game.name, stats.avg, stats.total);
-
-                // 4. Sistema de XP e Nível
-                const user = db.prepare(`SELECT * FROM usuarios WHERE user_id=?`).get(userId);
-                let totalXp = (user?.xp || 0) + gainXp;
-                let level = user?.level || 1;
-
-                while (totalXp >= level * 500) {
-                    totalXp -= (level * 500);
-                    level++;
-                }
-
-                db.prepare(`
-                    INSERT INTO usuarios (user_id, username, xp, level) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET xp=?, level=?, username=?
-                `).run(userId, username, totalXp, level, totalXp, level, username);
-
-                await interaction.update({
-                    content: `✅ Avaliação registrada! **+${gainXp} XP** | 🏆 Nível **${level}**`,
-                    embeds: [],
-                    components: []
-                });
-            }
             return;
         }
 
         // ================= MODAL =================
         if (interaction.isModalSubmit()) {
-            const gameId = interaction.customId.split('_')[1];
-            const nota = interaction.fields.getTextInputValue('nota');
 
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`xp_zerou_${gameId}_${nota}`)
-                    .setLabel('🎮 Zerou (+50 XP)')
-                    .setStyle(ButtonStyle.Primary),
-                new ButtonBuilder()
-                    .setCustomId(`xp_100_${gameId}_${nota}`)
-                    .setLabel('💯 100% (+200 XP)')
-                    .setStyle(ButtonStyle.Success)
-            );
+            const [, id] = interaction.customId.split('_');
+            const nota = parseFloat(interaction.fields.getTextInputValue('nota'));
+
+            if (isNaN(nota) || nota < 0 || nota > 10) {
+                return interaction.reply({ content: "Nota inválida", ephemeral: true });
+            }
+
+            const userId = interaction.user.id;
+            const username = interaction.user.tag;
+
+            db.prepare(`
+                INSERT INTO votos_filmes (movie_id, user_id, username, score)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(movie_id, user_id) DO UPDATE SET score = excluded.score
+            `).run(id, userId, username, nota);
+
+            const stats = db.prepare(`
+                SELECT AVG(score) as avg, COUNT(*) as total
+                FROM votos_filmes
+                WHERE movie_id = ?
+            `).get(id);
+
+            const movie = await getMovieDetails(id);
+
+            db.prepare(`
+                INSERT INTO avaliacoes_filmes (movie_id, title, server_score, vote_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(movie_id) DO UPDATE SET
+                    server_score = excluded.server_score,
+                    vote_count = excluded.vote_count
+            `).run(id, movie.title || movie.name, stats.avg, stats.total);
 
             await interaction.reply({
-                content: `Você deu nota **${nota}**! Como você completou o jogo?`,
-                components: [row],
+                content: `⭐ Nota registrada: ${nota} | Média: ${stats.avg.toFixed(1)}`,
                 ephemeral: true
             });
+
             return;
         }
 
-        // ================= COMANDOS SLASH =================
+        // ================= COMANDOS =================
         if (interaction.isChatInputCommand()) {
+
             const { commandName } = interaction;
 
-            // BUSCAR JOGO
-            if (commandName === 'jogo') {
-                await interaction.deferReply();
-                const nome = interaction.options.getString('titulo');
-                const results = await searchGame(nome);
+            // 🎬 BUSCAR
+            if (commandName === 'filme') {
 
-                if (!results || results.length === 0) {
-                    return interaction.editReply("❌ Nenhum jogo encontrado.");
+                await interaction.deferReply();
+
+                const titulo = interaction.options.getString('titulo');
+                const results = await searchMovie(titulo);
+
+                if (!results.length) {
+                    return interaction.editReply("Nada encontrado.");
                 }
 
                 const embed = new EmbedBuilder()
-                    .setTitle(`Resultados para: ${nome}`)
-                    .setDescription(results.slice(0, 5).map((g, i) => `**${i + 1}.** ${g.name}`).join('\n'))
-                    .setColor(0x5865F2);
+                    .setTitle(`Resultados para "${titulo}"`)
+                    .setDescription(
+                        results.map((m, i) =>
+                            `${i + 1}. ${m.title} ${m.media_type === "tv" ? "📺" : "🎬"}`
+                        ).join('\n')
+                    );
 
                 const row = new ActionRowBuilder().addComponents(
-                    results.slice(0, 5).map((g, i) =>
+                    results.map((m, i) =>
                         new ButtonBuilder()
-                            .setCustomId(`jogo_escolha_${g.id}`)
+                            .setCustomId(`filme_escolha_${m.id}_${m.media_type}`)
                             .setLabel(`${i + 1}`)
-                            .setStyle(ButtonStyle.Secondary)
+                            .setStyle(ButtonStyle.Primary)
                     )
                 );
 
-                await interaction.editReply({ embeds: [embed], components: [row] });
+                await interaction.editReply({
+                    embeds: [embed],
+                    components: [row]
+                });
             }
 
-            // LISTAR JOGOS AVALIADOS
-            if (commandName === 'jogosavaliados') {
+            // 🎬 LISTA
+            if (commandName === 'filmesavaliados') {
+
                 await interaction.deferReply();
-                const jogos = db.prepare(`SELECT title, server_score, vote_count FROM avaliacoes_jogos ORDER BY server_score DESC`).all();
 
-                if (!jogos.length) return interaction.editReply("Nenhum jogo avaliado ainda.");
+                const filmes = db.prepare(`
+                    SELECT title, server_score, vote_count
+                    FROM avaliacoes_filmes
+                    ORDER BY server_score DESC
+                `).all();
 
-                const lista = jogos.map(j => `⭐ **${j.server_score.toFixed(1)}** | ${j.title} (${j.vote_count} votos)`).join('\n');
-                const embed = new EmbedBuilder()
-                    .setTitle("🏆 Biblioteca do Servidor")
-                    .setDescription(lista.slice(0, 4000))
-                    .setColor(0xFFD700);
-
-                await interaction.editReply({ embeds: [embed] });
-            }
-
-            // PERFIL DO JOGADOR
-            if (commandName === 'perfil') {
-                await interaction.deferReply();
-                const target = interaction.options.getUser('usuario') || interaction.user;
-                const stats = db.prepare(`SELECT xp, level FROM usuarios WHERE user_id=?`).get(target.id);
-
-                const xp = stats?.xp || 0;
-                const lvl = stats?.level || 1;
-                const barra = criarBarraXp(xp, lvl);
-
-                const embed = new EmbedBuilder()
-                    .setTitle(`Perfil de ${target.username}`)
-                    .setThumbnail(target.displayAvatarURL())
-                    .addFields(
-                        { name: "🏆 Nível", value: lvl.toString(), inline: true },
-                        { name: "✨ Progresso", value: barra }
-                    )
-                    .setColor(0x00AE86);
-
-                await interaction.editReply({ embeds: [embed] });
-            }
-
-            // RANKING DE XP
-            if (commandName === 'ranking') {
-                await interaction.deferReply();
-                const top = db.prepare(`SELECT username, xp, level FROM usuarios ORDER BY level DESC, xp DESC LIMIT 10`).all();
-
-                if (!top.length) return interaction.editReply("Ranking vazio.");
-
-                const texto = top.map((u, i) => `**${i + 1}.** ${u.username} — Lvl ${u.level} (${u.xp} XP)`).join("\n");
-                const embed = new EmbedBuilder().setTitle("🏆 Top Players").setDescription(texto).setColor(0xF1C40F);
-
-                await interaction.editReply({ embeds: [embed] });
-            }
-
-            // RECOMENDAÇÃO INTELIGENTE (FILTRADA)
-            if (commandName === 'recomendacaointeligente') {
-                await interaction.deferReply();
-                const userId = interaction.user.id;
-
-                // Busca o jogo melhor avaliado que o usuário ainda NÃO votou
-                const topGame = db.prepare(`
-                    SELECT title, server_score 
-                    FROM avaliacoes_jogos 
-                    WHERE game_id NOT IN (
-                        SELECT game_id FROM votos_jogos WHERE user_id = ?
-                    )
-                    ORDER BY server_score DESC 
-                    LIMIT 1
-                `).get(userId);
-
-                if (!topGame) {
-                    return interaction.editReply("✨ Você já avaliou todos os jogos da nossa base ou não há jogos avaliados ainda!");
+                if (!filmes.length) {
+                    return interaction.editReply("Nenhum filme avaliado.");
                 }
 
                 const embed = new EmbedBuilder()
-                    .setTitle("🧠 Sugestão Personalizada")
-                    .setDescription(`Baseado na média do servidor, mas que você **ainda não jogou**: \n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
-                    .setColor(0x9B59B6)
-                    .setFooter({ text: "Dica: Use /jogo para avaliar novos títulos!" });
+                    .setTitle("🎬 Filmes avaliados")
+                    .setDescription(
+                        filmes.map((f, i) =>
+                            `${i + 1}. ${f.title} ⭐ ${f.server_score?.toFixed(1) || 0} (${f.vote_count})`
+                        ).join('\n')
+                    );
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            // 📊 STATS
+            if (commandName === 'stats') {
+
+                await interaction.deferReply();
+
+                const total = db.prepare(`
+                    SELECT COUNT(*) as total FROM votos_filmes
+                `).get();
+
+                const usuarios = db.prepare(`
+                    SELECT COUNT(DISTINCT user_id) as total FROM votos_filmes
+                `).get();
+
+                const embed = new EmbedBuilder()
+                    .setTitle("📊 Estatísticas")
+                    .addFields(
+                        { name: "Total de avaliações", value: `${total.total}`, inline: true },
+                        { name: "Usuários ativos", value: `${usuarios.total}`, inline: true }
+                    );
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            // 🎯 RECOMENDAR
+            if (commandName === 'recomendar') {
+
+                await interaction.deferReply();
+
+                const genero = interaction.options.getString('genero');
+                const filmes = await getMoviesByGenre(genero);
+
+                const embed = new EmbedBuilder()
+                    .setTitle("🎯 Recomendações")
+                    .setDescription(
+                        filmes.slice(0, 10).map(f => `• ${f.title}`).join('\n')
+                    );
 
                 await interaction.editReply({ embeds: [embed] });
             }
         }
+
     } catch (err) {
-        console.error("ERRO NA INTERAÇÃO:", err);
-        if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ content: "Houve um erro ao processar seu comando.", ephemeral: true }).catch(() => {});
+        console.error("ERRO:", err);
+
+        if (interaction.deferred) {
+            await interaction.editReply("❌ Erro.");
+        } else {
+            await interaction.reply({ content: "❌ Erro.", ephemeral: true });
         }
     }
 });
