@@ -30,10 +30,9 @@ client.once(Events.ClientReady, c => {
 client.on(Events.InteractionCreate, async interaction => {
     try {
 
-        // ===== BOTÕES =====
+        // ================= BOTÕES =================
         if (interaction.isButton()) {
 
-            // escolher jogo
             if (interaction.customId.startsWith('jogo_escolha_')) {
 
                 const id = interaction.customId.split('_')[2];
@@ -54,7 +53,6 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.update({ embeds: [embed], components: [row] });
             }
 
-            // abrir modal
             if (interaction.customId.startsWith('avaliar_jogo_')) {
 
                 const id = interaction.customId.split('_')[2];
@@ -75,19 +73,16 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.showModal(modal);
             }
 
-            // ===== BOTÕES XP =====
             if (interaction.customId.startsWith('xp_')) {
 
                 const [_, tipo, gameId, nota] = interaction.customId.split('_');
 
                 const userId = interaction.user.id;
                 const username = interaction.user.tag;
-
                 const score = parseFloat(nota);
 
                 let xp = tipo === 'zerou' ? 50 : 200;
 
-                // salvar voto
                 db.prepare(`
                     INSERT INTO votos_jogos VALUES (?, ?, ?, ?)
                     ON CONFLICT(game_id, user_id) DO UPDATE SET score=excluded.score
@@ -130,7 +125,7 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // ===== MODAL =====
+        // ================= MODAL =================
         if (interaction.isModalSubmit()) {
 
             const gameId = interaction.customId.split('_')[1];
@@ -157,11 +152,12 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // ===== COMANDOS =====
+        // ================= COMANDOS =================
         if (interaction.isChatInputCommand()) {
 
             const { commandName } = interaction;
 
+            // ===== BUSCAR JOGO =====
             if (commandName === 'jogo') {
 
                 await interaction.deferReply();
@@ -185,11 +181,12 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.editReply({ embeds:[embed], components:[row] });
             }
 
+            // ===== PERFIL =====
             if (commandName === 'perfil') {
 
                 await interaction.deferReply();
 
-                const user = interaction.user;
+                const user = interaction.options.getUser('usuario') || interaction.user;
 
                 const stats = db.prepare(`
                     SELECT xp, level FROM usuarios WHERE user_id=?
@@ -200,11 +197,82 @@ client.on(Events.InteractionCreate, async interaction => {
                 const embed = new EmbedBuilder()
                     .setTitle(`👤 ${user.tag}`)
                     .addFields(
-                        { name: "🏆 Nível", value: stats?.level?.toString() || "1", inline: true },
+                        { name: "🏆 Nível", value: (stats?.level || 1).toString(), inline: true },
                         { name: "✨ XP", value: barra }
                     );
 
                 await interaction.editReply({ embeds:[embed] });
+            }
+
+            // ===== RANKING =====
+            if (commandName === 'ranking') {
+
+                await interaction.deferReply();
+
+                const top = db.prepare(`
+                    SELECT username, xp FROM usuarios
+                    ORDER BY xp DESC
+                    LIMIT 10
+                `).all();
+
+                if (!top.length) {
+                    return interaction.editReply("Ninguém no ranking ainda.");
+                }
+
+                const texto = top.map((u, i) =>
+                    `**${i+1}.** ${u.username} — ${u.xp} XP`
+                ).join("\n");
+
+                const embed = new EmbedBuilder()
+                    .setTitle("🏆 Ranking")
+                    .setDescription(texto);
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            // ===== RECOMENDAR JOGO =====
+            if (commandName === 'recomendarjogo') {
+
+                await interaction.deferReply();
+
+                const nome = interaction.options.getString('titulo');
+                const results = await searchGame(nome);
+
+                if (!results.length) {
+                    return interaction.editReply("❌ Nenhum jogo encontrado.");
+                }
+
+                const jogo = results[0];
+
+                const embed = new EmbedBuilder()
+                    .setTitle(`🎮 Recomendação: ${jogo.name}`)
+                    .setDescription("Recomendado pela comunidade!")
+                    .setThumbnail(jogo.background_image);
+
+                await interaction.editReply({ embeds: [embed] });
+            }
+
+            // ===== RECOMENDAÇÃO INTELIGENTE =====
+            if (commandName === 'recomendacaointeligente') {
+
+                await interaction.deferReply();
+
+                const topGame = db.prepare(`
+                    SELECT game_name, server_score 
+                    FROM avaliacoes_jogos
+                    ORDER BY server_score DESC
+                    LIMIT 1
+                `).get();
+
+                if (!topGame) {
+                    return interaction.editReply("Ainda não há recomendações.");
+                }
+
+                const embed = new EmbedBuilder()
+                    .setTitle("🧠 Recomendação Inteligente")
+                    .setDescription(`🔥 ${topGame.game_name}\n⭐ Nota média: ${topGame.server_score.toFixed(1)}`);
+
+                await interaction.editReply({ embeds: [embed] });
             }
         }
 
