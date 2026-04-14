@@ -24,7 +24,7 @@ function criarBarraXp(xp, level) {
 }
 
 client.once(Events.ClientReady, c => {
-    console.log(`🎮 Bot online como ${c.user.tag} no Railway!`);
+    console.log(`🎮 Bot online como ${c.user.tag} atualizado com botão Joguei!`);
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -79,20 +79,23 @@ client.on(Events.InteractionCreate, async interaction => {
                 if (isNaN(score)) score = 0;
                 score = Math.max(0, Math.min(10, score));
 
-                let gainXp = tipo === 'zerou' ? 50 : 200;
+                // Lógica de XP baseada no novo botão
+                let gainXp = 0;
+                if (tipo === 'joguei') gainXp = 25;
+                else if (tipo === 'zerou') gainXp = 50;
+                else if (tipo === '100') gainXp = 200;
 
-                // 1. Salvar voto individual
+                // 1. Salvar voto
                 db.prepare(`
                     INSERT INTO votos_jogos (game_id, user_id, username, score) 
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(game_id, user_id) DO UPDATE SET score=excluded.score
                 `).run(gameId, userId, username, score);
 
-                // 2. Média do jogo
                 const stats = db.prepare(`SELECT AVG(score) as avg, COUNT(*) as total FROM votos_jogos WHERE game_id=?`).get(gameId);
                 const game = await getGameDetails(gameId);
 
-                // 3. Atualizar biblioteca global
+                // 2. Atualizar avaliações
                 db.prepare(`
                     INSERT INTO avaliacoes_jogos (game_id, title, server_score, vote_count) 
                     VALUES (?, ?, ?, ?)
@@ -101,7 +104,7 @@ client.on(Events.InteractionCreate, async interaction => {
                     vote_count=excluded.vote_count
                 `).run(gameId, game.name, stats.avg, stats.total);
 
-                // 4. Evolução de XP
+                // 3. Sistema de XP
                 const user = db.prepare(`SELECT * FROM usuarios WHERE user_id=?`).get(userId);
                 let totalXp = (user?.xp || 0) + gainXp;
                 let level = user?.level || 1;
@@ -117,7 +120,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 `).run(userId, username, totalXp, level, totalXp, level, username);
 
                 await interaction.update({
-                    content: `✅ Avaliação salva! **+${gainXp} XP** | 🏆 Nível **${level}**`,
+                    content: `✅ Experiência registrada! **+${gainXp} XP** | 🏆 Nível **${level}**`,
                     embeds: [],
                     components: []
                 });
@@ -130,10 +133,15 @@ client.on(Events.InteractionCreate, async interaction => {
             const gameId = interaction.customId.split('_')[1];
             const nota = interaction.fields.getTextInputValue('nota');
 
+            // Adicionado o novo botão "Joguei"
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
+                    .setCustomId(`xp_joguei_${gameId}_${nota}`)
+                    .setLabel('🎮 Apenas joguei (+25 XP)')
+                    .setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder()
                     .setCustomId(`xp_zerou_${gameId}_${nota}`)
-                    .setLabel('🎮 Zerou (+50 XP)')
+                    .setLabel('🚩 Zerou (+50 XP)')
                     .setStyle(ButtonStyle.Primary),
                 new ButtonBuilder()
                     .setCustomId(`xp_100_${gameId}_${nota}`)
@@ -142,7 +150,7 @@ client.on(Events.InteractionCreate, async interaction => {
             );
 
             await interaction.reply({
-                content: `Você deu nota **${nota}**! Como foi sua jornada?`,
+                content: `Nota **${nota}** enviada! Qual o seu status nesse jogo?`,
                 components: [row],
                 ephemeral: true
             });
@@ -161,7 +169,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 if (!results || results.length === 0) return interaction.editReply("❌ Nada encontrado.");
 
                 const embed = new EmbedBuilder()
-                    .setTitle(`Resultados para: ${nome}`)
+                    .setTitle(`Busca: ${nome}`)
                     .setDescription(results.slice(0, 5).map((g, i) => `**${i + 1}.** ${g.name}`).join('\n'))
                     .setColor(0x5865F2);
 
@@ -179,10 +187,10 @@ client.on(Events.InteractionCreate, async interaction => {
             if (commandName === 'jogosavaliados') {
                 await interaction.deferReply();
                 const jogos = db.prepare(`SELECT title, server_score, vote_count FROM avaliacoes_jogos ORDER BY server_score DESC`).all();
-                if (!jogos.length) return interaction.editReply("Biblioteca vazia.");
+                if (!jogos.length) return interaction.editReply("Nenhum registro ainda.");
 
                 const lista = jogos.map(j => `⭐ **${j.server_score.toFixed(1)}** | ${j.title} (${j.vote_count} votos)`).join('\n');
-                const embed = new EmbedBuilder().setTitle("📚 Biblioteca do Servidor").setDescription(lista.slice(0, 4000)).setColor(0xFFD700);
+                const embed = new EmbedBuilder().setTitle("📚 Biblioteca").setDescription(lista.slice(0, 4000)).setColor(0xFFD700);
                 await interaction.editReply({ embeds: [embed] });
             }
 
@@ -190,12 +198,14 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.deferReply();
                 const target = interaction.options.getUser('usuario') || interaction.user;
                 const stats = db.prepare(`SELECT xp, level FROM usuarios WHERE user_id=?`).get(target.id);
-                const barra = criarBarraXp(stats?.xp || 0, stats?.level || 1);
+                const xp = stats?.xp || 0;
+                const lvl = stats?.level || 1;
+                const barra = criarBarraXp(xp, lvl);
                 
                 const embed = new EmbedBuilder()
                     .setTitle(`Perfil de ${target.username}`)
                     .setThumbnail(target.displayAvatarURL())
-                    .addFields({ name: "🏆 Nível", value: (stats?.level || 1).toString(), inline: true }, { name: "✨ Progresso", value: barra })
+                    .addFields({ name: "🏆 Nível", value: lvl.toString(), inline: true }, { name: "✨ XP", value: barra })
                     .setColor(0x00AE86);
                 await interaction.editReply({ embeds: [embed] });
             }
@@ -205,15 +215,13 @@ client.on(Events.InteractionCreate, async interaction => {
                 const top = db.prepare(`SELECT username, xp, level FROM usuarios ORDER BY level DESC, xp DESC LIMIT 10`).all();
                 if (!top.length) return interaction.editReply("Ranking vazio.");
                 const texto = top.map((u, i) => `**${i + 1}.** ${u.username} — Lvl ${u.level} (${u.xp} XP)`).join("\n");
-                const embed = new EmbedBuilder().setTitle("🏆 Top Jogadores").setDescription(texto).setColor(0xF1C40F);
+                const embed = new EmbedBuilder().setTitle("🏆 Top Players").setDescription(texto).setColor(0xF1C40F);
                 await interaction.editReply({ embeds: [embed] });
             }
 
             if (commandName === 'recomendacaointeligente') {
                 await interaction.deferReply();
                 const userId = interaction.user.id;
-                
-                // Busca o jogo melhor avaliado que o usuário atual ainda não votou
                 const topGame = db.prepare(`
                     SELECT title, server_score 
                     FROM avaliacoes_jogos 
@@ -221,17 +229,17 @@ client.on(Events.InteractionCreate, async interaction => {
                     ORDER BY server_score DESC LIMIT 1
                 `).get(userId);
 
-                if (!topGame) return interaction.editReply("✨ Você já avaliou todos os jogos ou não há novos dados!");
+                if (!topGame) return interaction.editReply("✨ Você já viu tudo por aqui!");
 
                 const embed = new EmbedBuilder()
-                    .setTitle("🧠 Dica de Mestre")
-                    .setDescription(`Baseado na galera, mas que você **ainda não avaliou**: \n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
+                    .setTitle("🧠 Sugestão para Você")
+                    .setDescription(`Baseado no servidor, mas que você **ainda não avaliou**: \n\n🔥 **${topGame.title}**\n⭐ Média: \`${topGame.server_score.toFixed(1)}\``)
                     .setColor(0x9B59B6);
                 await interaction.editReply({ embeds: [embed] });
             }
         }
     } catch (err) {
-        console.error("ERRO CRÍTICO:", err);
+        console.error("ERRO:", err);
     }
 });
 
